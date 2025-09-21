@@ -1,4 +1,3 @@
-
 name: GitHub Repository Crawler
 
 on:
@@ -7,8 +6,9 @@ on:
     branches: [ main ]
 
 jobs:
-  crawl-repositories:
+  crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     
     services:
       postgres:
@@ -26,80 +26,41 @@ jobs:
           - 5432:5432
 
     steps:
-    - name: Checkout code
+    - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Set up Python
+    - name: Setup Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
 
     - name: Install dependencies
-      run: |
-        pip install aiohttp asyncpg
+      run: pip install -r requirements.txt
 
-    - name: Setup PostgreSQL Schema
-      run: |
-        python -c "
-import asyncio
-import asyncpg
-import os
-
-async def setup():
-    conn = await asyncpg.connect(os.environ['DATABASE_URL'])
-    await conn.execute('''
-        CREATE TABLE IF NOT EXISTS repositories (
-            id SERIAL PRIMARY KEY,
-            github_id VARCHAR(255) UNIQUE NOT NULL,
-            name_with_owner VARCHAR(255) NOT NULL,
-            star_count INTEGER NOT NULL DEFAULT 0,
-            language VARCHAR(100),
-            updated_at TIMESTAMP,
-            crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        CREATE INDEX IF NOT EXISTS idx_repositories_github_id ON repositories(github_id);
-        CREATE INDEX IF NOT EXISTS idx_repositories_stars ON repositories(star_count DESC);
-    ''')
-    await conn.close()
-    print('Database setup complete')
-
-asyncio.run(setup())
-        "
-      env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
-
-    - name: Crawl GitHub Repositories
+    - name: Crawl repositories
       run: python main.py
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
-      timeout-minutes: 180
 
-    - name: Export Results
+    - name: Export data
       run: |
         python -c "
-import asyncio
-import asyncpg
-import json
-import csv
-import os
-
+import asyncio, asyncpg, json, csv, os
 async def export():
     conn = await asyncpg.connect(os.environ['DATABASE_URL'])
-    rows = await conn.fetch('SELECT * FROM repositories ORDER BY star_count DESC')
+    rows = await conn.fetch('SELECT github_id, name_with_owner, star_count FROM repositories ORDER BY star_count DESC')
     await conn.close()
     
-    # Export as JSON
-    data = [dict(row) for row in rows]
-    with open('repositories.json', 'w') as f:
-        json.dump(data, f, indent=2, default=str)
+    data = [{'github_id': r[0], 'name_with_owner': r[1], 'star_count': r[2]} for r in rows]
     
-    # Export as CSV
+    with open('repositories.json', 'w') as f:
+        json.dump(data, f, indent=2)
+    
     with open('repositories.csv', 'w', newline='') as f:
-        if data:
-            writer = csv.DictWriter(f, fieldnames=data[0].keys())
-            writer.writeheader()
-            writer.writerows(data)
+        writer = csv.DictWriter(f, fieldnames=['github_id', 'name_with_owner', 'star_count'])
+        writer.writeheader()
+        writer.writerows(data)
     
     print(f'Exported {len(data)} repositories')
 
@@ -108,38 +69,10 @@ asyncio.run(export())
       env:
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
 
-    - name: Upload Results
+    - name: Upload results
       uses: actions/upload-artifact@v3
       with:
-        name: github-repositories-data
+        name: github-repositories
         path: |
           repositories.json
           repositories.csv
-        retention-days: 30
-
-    - name: Display Summary
-      run: |
-        python -c "
-import asyncio
-import asyncpg
-import os
-
-async def summary():
-    conn = await asyncpg.connect(os.environ['DATABASE_URL'])
-    
-    total = await conn.fetchval('SELECT COUNT(*) FROM repositories')
-    top_repo = await conn.fetchrow('SELECT name_with_owner, star_count FROM repositories ORDER BY star_count DESC LIMIT 1')
-    langs = await conn.fetch('SELECT language, COUNT(*) as count FROM repositories WHERE language IS NOT NULL GROUP BY language ORDER BY count DESC LIMIT 5')
-    
-    await conn.close()
-    
-    print(f'📊 CRAWL SUMMARY')
-    print(f'Total repositories: {total:,}')
-    if top_repo:
-        print(f'Most starred: {top_repo[\"name_with_owner\"]} ({top_repo[\"star_count\"]:,} stars)')
-    print(f'Top languages: {[\", \".join([f\"{row[\"language\"]}: {row[\"count\"]}\" for row in langs])}')
-
-asyncio.run(summary())
-        "
-      env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
