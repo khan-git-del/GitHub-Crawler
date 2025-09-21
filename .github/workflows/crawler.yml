@@ -1,14 +1,20 @@
-name: GitHub Repository Crawler
+name: GitHub Repository Crawler - Production
 
 on:
   workflow_dispatch:
+    inputs:
+      target_repos:
+        description: 'Number of repositories to crawl'
+        required: true
+        default: '100000'
+        type: string
   push:
     branches: [ main ]
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360  # 6 hours maximum
     
     services:
       postgres:
