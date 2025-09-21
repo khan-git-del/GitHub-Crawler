@@ -32,6 +32,9 @@ async def fetch_repos(query: str, seen_repos: Set[str]) -> List[Repository]:
                     """, "variables": {"q": query, "cursor": cursor}}
             ) as resp:
                 data = await resp.json()
+                if "errors" in data or "message" in data:
+                    print(f"API Error: {data.get('message', data.get('errors', 'Unknown'))}")
+                    break
                 nodes = data["data"]["search"]["nodes"]
                 if not nodes:
                     break
@@ -45,11 +48,14 @@ async def fetch_repos(query: str, seen_repos: Set[str]) -> List[Repository]:
         return repos
 
 async def crawl_100k_repositories() -> List[Repository]:
+    if not os.getenv("GITHUB_TOKEN"):
+        print("❌ GITHUB_TOKEN required")
+        sys.exit(1)
     seen_repos = set()
     queries = [
         "stars:>1000", "stars:100..999", "stars:10..99", "language:python stars:1..9",
         "language:javascript stars:1..9", "language:java stars:1..9", "created:2024-01-01..2025-09-21"
-    ] * 20  # Repeat to ensure enough coverage
+    ] * 25  # Increased repetition for 100,000
     all_repos = []
     semaphore = asyncio.Semaphore(10)
     
@@ -79,9 +85,6 @@ async def save_repos(repos: List[Repository]):
     await conn.close()
 
 async def main():
-    if not os.getenv("GITHUB_TOKEN"):
-        print("❌ GITHUB_TOKEN required")
-        sys.exit(1)
     repos = await crawl_100k_repositories()
     print(f"🏁 Collected {len(repos)} repositories")
     await save_repos(repos)
