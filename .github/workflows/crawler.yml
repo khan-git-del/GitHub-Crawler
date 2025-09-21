@@ -2,12 +2,6 @@ name: GitHub Repository Crawler - Production
 
 on:
   workflow_dispatch:
-    inputs:
-      target_repos:
-        description: 'Number of repositories to crawl'
-        required: true
-        default: '100000'
-        type: string
   push:
     branches: [ main ]
 
@@ -43,10 +37,15 @@ jobs:
     - name: Install dependencies
       run: pip install -r requirements.txt
 
-    - name: Crawl repositories
+    - name: Setup Postgres
+      run: python setup_db.py
+      env:
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
+
+    - name: Crawl-stars
       run: python main.py
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ github.token }}
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
 
     - name: Export data
