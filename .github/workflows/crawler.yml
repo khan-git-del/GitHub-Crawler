@@ -8,8 +8,8 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours maximum
-    
+    timeout-minutes: 360
+
     services:
       postgres:
         image: postgres:15
@@ -56,18 +56,16 @@ jobs:
             conn = await asyncpg.connect(os.environ['DATABASE_URL'])
             rows = await conn.fetch('SELECT github_id, name_with_owner, star_count FROM repositories ORDER BY star_count DESC')
             await conn.close()
-            
+
             data = [{'github_id': r[0], 'name_with_owner': r[1], 'star_count': r[2]} for r in rows]
-            
+
             with open('repositories.json', 'w') as f:
                 json.dump(data, f, indent=2)
-            
+
             with open('repositories.csv', 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=['github_id', 'name_with_owner', 'star_count'])
                 writer.writeheader()
                 writer.writerows(data)
-            
-            print(f'Exported {len(data)} repositories')
 
         asyncio.run(export())
         "
