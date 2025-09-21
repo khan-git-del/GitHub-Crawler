@@ -29,7 +29,7 @@ class GitHubAPIAdapter:
         self.rate_limit_remaining: int = 5000
         self.rate_limit_reset_at: Optional[datetime] = None
         self.rate_limit_limit: int = 5000
-        self.rate_limit_cost: int = 1
+        self.rate_limit_cost: int = 1  # Default assumption
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
@@ -46,6 +46,7 @@ class GitHubAPIAdapter:
             await self.session.close()
 
     async def check_rate_limit(self, expected_cost: int = 1):
+        """Proactively check and wait for rate limits"""
         if self.rate_limit_remaining < (expected_cost + 100):
             if self.rate_limit_reset_at:
                 wait_time = max(0, (self.rate_limit_reset_at - datetime.utcnow()).total_seconds() + 10)
@@ -55,7 +56,9 @@ class GitHubAPIAdapter:
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60))
     async def execute_graphql(self, query: str, variables: dict) -> dict:
+        """Execute GraphQL with retries and timeout"""
         await self.check_rate_limit(expected_cost=1)
+
         async with self.session.post(
             "https://api.github.com/graphql",
             json={"query": query, "variables": variables}
@@ -93,7 +96,9 @@ class ProductionGitHubCrawler:
         await self.api_adapter.__aexit__(exc_type, exc_val, exc_tb)
 
     def generate_comprehensive_queries(self) -> List[str]:
+        """Generate ~200 optimized queries for faster coverage"""
         queries = []
+
         star_ranges = [
             ">=50000", "10000..49999", "5000..9999", "1000..4999",
             "500..999", "200..499", "100..199", "50..99", "20..49",
@@ -129,6 +134,7 @@ class ProductionGitHubCrawler:
         return queries
 
     async def execute_graphql_query(self, search_query: str) -> List[Repository]:
+        """Fetch repos for a query using adapter with max pages limit"""
         graphql_query = """
         query($searchQuery: String!, $cursor: String) {
             search(query: $searchQuery, type: REPOSITORY, first: 100, after: $cursor) {
@@ -197,7 +203,8 @@ class ProductionGitHubCrawler:
 
         return repositories
 
-    async def crawl_100k_repositories(self) -> Tuple[Repository, ...]:
+    async def crawl_100k_repositories(self) -> Tuple[List[Repository]]:
+        """Collect 100,000 repos with parallel batches and timeout"""
         all_repositories = []
         queries = self.generate_comprehensive_queries()
         random.shuffle(queries)
@@ -214,6 +221,7 @@ class ProductionGitHubCrawler:
                 break
 
             batch_queries = queries[batch_start:batch_start + batch_size]
+
             try:
                 batch_results = await asyncio.wait_for(
                     asyncio.gather(*[limited_exec(q) for q in batch_queries]),
@@ -228,6 +236,7 @@ class ProductionGitHubCrawler:
         return final_repos
 
 class RepositorySaver:
+    """Separated concern for saving repositories"""
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
         self.pool = None
@@ -281,8 +290,9 @@ async def main():
                     await saver.save_repositories_batch(batch)
 
             duration = (datetime.now() - start_time).total_seconds()
+            print(f"Completed in {duration/60:.1f} minutes")
 
-    except Exception:
+    except Exception as e:
         import traceback
         traceback.print_exc()
         sys.exit(1)
