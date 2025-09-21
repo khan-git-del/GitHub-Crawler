@@ -70,7 +70,7 @@ jobs:
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
 
     - name: Upload results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: github-repositories
         path: |
