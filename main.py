@@ -13,14 +13,12 @@ from dataclasses import dataclass
 from typing import List, Set
 from datetime import datetime
 
-print("🚀 Starting GitHub Repository Crawler", flush=True)
-
 @dataclass
 class Repository:
     github_id: str
     name_with_owner: str
     star_count: int
-    updated_at: str
+    updated_at: datetime
 
 class GitHubCrawler:
     def __init__(self, token: str):
@@ -102,6 +100,11 @@ class GitHubCrawler:
                     data = await response.json()
                 
                 if "errors" in data:
+                    print(f"API Error: {data['errors'][0]['message']}")
+                    break
+                
+                if "data" not in data:
+                    print(f"Missing data field in response for query: {query}")
                     break
                 
                 search = data["data"]["search"]
@@ -118,7 +121,7 @@ class GitHubCrawler:
                             github_id=node["id"],
                             name_with_owner=node["nameWithOwner"],
                             star_count=node["stargazerCount"],
-                            updated_at=node["updatedAt"]
+                            updated_at=datetime.fromisoformat(node["updatedAt"].replace('Z', '+00:00'))
                         ))
                 
                 # Check pagination
