@@ -9,14 +9,14 @@ import aiohttp
 import asyncpg
 import os
 import sys
-from dataclasses import dataclass, frozen=True
+from dataclasses import dataclass
 from typing import List, Set, Optional, Tuple
 from datetime import datetime
 import json
 import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-@dataclass(frozen=True)
+@dataclass(frozen=True)  # Correct placement of frozen=True
 class Repository:
     github_id: str
     name_with_owner: str
