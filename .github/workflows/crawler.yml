@@ -1,83 +1,21 @@
-name: GitHub Repository Crawler - Production
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
+name: Crawl Repositories
+on: [push]
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours maximum
-    
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: github_crawler
-          POSTGRES_USER: postgres
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
+    timeout-minutes: 60
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-
-    - name: Install dependencies
-      run: pip install -r requirements.txt
-
-    - name: Setup Postgres
-      run: python setup_db.py
+    - uses: actions/checkout@v3
+    - uses: actions/setup-python@v4
+      with: {python-version: '3.11'}
+    - run: pip install aiohttp asyncpg
+    - run: python main.py
       env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
-
-    - name: Crawl-stars
-      run: python main.py
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
-
-    - name: Export data
+    - name: Export and Upload
       run: |
-        python -c "
-        import asyncio, asyncpg, json, csv, os
-        async def export():
-            conn = await asyncpg.connect(os.environ['DATABASE_URL'])
-            rows = await conn.fetch('SELECT github_id, name_with_owner, star_count FROM repositories ORDER BY star_count DESC')
-            await conn.close()
-            
-            data = [{'github_id': r[0], 'name_with_owner': r[1], 'star_count': r[2]} for r in rows]
-            
-            with open('repositories.json', 'w') as f:
-                json.dump(data, f, indent=2)
-            
-            with open('repositories.csv', 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['github_id', 'name_with_owner', 'star_count'])
-                writer.writeheader()
-                writer.writerows(data)
-            
-            print(f'Exported {len(data)} repositories')
-
-        asyncio.run(export())
-        "
+        pg_dump -h localhost -U postgres -t repositories github_crawler > repos.csv
+        aws s3 cp repos.csv s3://your-bucket/
       env:
-        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
-
-    - name: Upload results
-      uses: actions/upload-artifact@v4
-      with:
-        name: github-repositories
-        path: |
-          repositories.json
-          repositories.csv
+        PGPASSWORD: postgres
