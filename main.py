@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub Crawler - Crawls 100K repositories using multi-query strategy
-Handles GitHub API 1K search limit with smart query segmentation
+GitHub Crawler - Fixed version that handles API errors properly
 """
 
 import asyncio
@@ -18,7 +17,6 @@ class Repository:
     github_id: str
     name_with_owner: str
     star_count: int
-    updated_at: datetime
 
 class GitHubCrawler:
     def __init__(self, token: str):
@@ -37,28 +35,24 @@ class GitHubCrawler:
             await self.session.close()
     
     def get_search_queries(self) -> List[str]:
-        """Generate search queries to bypass 1K limit"""
+        """Generate effective search queries"""
         queries = []
         
-        # High-value repos by star count
+        # Focus on proven working queries
         star_ranges = [
-            ">=10000", "5000..9999", "2500..4999", "1000..2499", 
-            "500..999", "250..499", "100..249", "50..99", "25..49"
+            ">=50000", "25000..49999", "10000..24999", "5000..9999", 
+            "2500..4999", "1000..2499", "500..999", "250..499", "100..249", "50..99"
         ]
         for stars in star_ranges:
             queries.append(f"stars:{stars}")
         
-        # Popular languages
-        languages = ["javascript", "python", "java", "typescript", "go", "rust", "c++", "php"]
+        # Popular languages with moderate star counts (these work better)
+        languages = ["javascript", "python", "java", "typescript", "go", "rust"]
         for lang in languages:
-            for stars in ["10..24", "5..9", "2..4", "1"]:
+            for stars in ["25..49", "10..24", "5..9"]:
                 queries.append(f"language:{lang} stars:{stars}")
         
-        # Recent repos for diversity  
-        for month in range(1, 13):
-            queries.append(f"stars:1..2 created:2023-{month:02d}-01..2023-{month:02d}-28")
-        
-        return queries[:100]  # Limit queries to avoid rate issues
+        return queries[:50]  # Limit to 50 reliable queries
     
     async def fetch_batch(self, query: str) -> List[Repository]:
         """Fetch repositories for one search query"""
@@ -70,7 +64,6 @@ class GitHubCrawler:
                         id
                         nameWithOwner
                         stargazerCount
-                        updatedAt
                     }
                 }
                 pageInfo {
@@ -87,7 +80,7 @@ class GitHubCrawler:
         repos = []
         cursor = None
         
-        # Fetch up to 1000 repos per query (API limit)
+        # Fetch up to 1000 repos per query
         while len(repos) < 1000:
             try:
                 async with self.session.post(
@@ -97,47 +90,57 @@ class GitHubCrawler:
                         "variables": {"searchQuery": query, "cursor": cursor}
                     }
                 ) as response:
+                    
+                    if response.status != 200:
+                        print(f"HTTP {response.status} for query: {query}")
+                        break
+                    
                     data = await response.json()
                 
-                if "errors" in data:
-                    print(f"API Error: {data['errors'][0]['message']}")
-                    break
-                
-                if "data" not in data:
-                    print(f"Missing data field in response for query: {query}")
-                    break
-                
-                search = data["data"]["search"]
-                nodes = search["nodes"]
-                
-                if not nodes:
-                    break
-                
-                # Add unique repos only
-                for node in nodes:
-                    if node["id"] not in self.seen_repos:
-                        self.seen_repos.add(node["id"])
-                        repos.append(Repository(
-                            github_id=node["id"],
-                            name_with_owner=node["nameWithOwner"],
-                            star_count=node["stargazerCount"],
-                            updated_at=datetime.fromisoformat(node["updatedAt"].replace('Z', '+00:00'))
-                        ))
-                
-                # Check pagination
-                page_info = search["pageInfo"]
-                if not page_info["hasNextPage"]:
-                    break
-                cursor = page_info["endCursor"]
-                
-                # Rate limit check
-                if data["data"]["rateLimit"]["remaining"] < 100:
-                    await asyncio.sleep(60)  # Wait 1 minute
-                
-                await asyncio.sleep(0.1)  # Small delay
-                
+                    if "errors" in data:
+                        print(f"GraphQL Error in '{query}': {data['errors'][0]['message']}")
+                        break
+                    
+                    if "data" not in data or not data["data"]:
+                        print(f"No data returned for query: {query}")
+                        break
+                    
+                    search = data["data"]["search"]
+                    if not search or "nodes" not in search:
+                        print(f"Invalid search response for: {query}")
+                        break
+                        
+                    nodes = search["nodes"]
+                    
+                    if not nodes:
+                        break
+                    
+                    # Add unique repos only
+                    for node in nodes:
+                        if node and "id" in node and node["id"] not in self.seen_repos:
+                            self.seen_repos.add(node["id"])
+                            repos.append(Repository(
+                                github_id=node["id"],
+                                name_with_owner=node.get("nameWithOwner", "unknown/unknown"),
+                                star_count=node.get("stargazerCount", 0)
+                            ))
+                    
+                    # Check pagination
+                    page_info = search.get("pageInfo", {})
+                    if not page_info.get("hasNextPage", False):
+                        break
+                    cursor = page_info.get("endCursor")
+                    
+                    # Rate limit check
+                    rate_limit = data["data"].get("rateLimit", {})
+                    if rate_limit.get("remaining", 1000) < 100:
+                        print(f"Rate limit low, waiting...")
+                        await asyncio.sleep(60)
+                    
+                    await asyncio.sleep(0.2)  # Small delay
+                    
             except Exception as e:
-                print(f"Error in query '{query}': {e}")
+                print(f"Network error in query '{query}': {e}")
                 break
         
         return repos
@@ -158,7 +161,7 @@ class GitHubCrawler:
             repos = await self.fetch_batch(query)
             all_repos.extend(repos)
             
-            if len(all_repos) % 10000 == 0:
+            if len(all_repos) % 5000 == 0 and len(all_repos) > 0:
                 print(f"🎯 Milestone: {len(all_repos)} repos collected")
         
         return all_repos[:100000]
@@ -186,7 +189,6 @@ class Database:
             github_id VARCHAR(100) UNIQUE NOT NULL,
             name_with_owner VARCHAR(200) NOT NULL,
             star_count INTEGER NOT NULL,
-            updated_at TIMESTAMP,
             crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
@@ -204,17 +206,16 @@ class Database:
             return
         
         sql = """
-        INSERT INTO repositories (github_id, name_with_owner, star_count, updated_at)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO repositories (github_id, name_with_owner, star_count)
+        VALUES ($1, $2, $3)
         ON CONFLICT (github_id) DO UPDATE SET
             star_count = EXCLUDED.star_count,
-            updated_at = EXCLUDED.updated_at,
             crawled_at = CURRENT_TIMESTAMP
         """
         
         async with self.pool.acquire() as conn:
             await conn.executemany(sql, [
-                (r.github_id, r.name_with_owner, r.star_count, r.updated_at)
+                (r.github_id, r.name_with_owner, r.star_count)
                 for r in repositories
             ])
         
@@ -236,10 +237,9 @@ async def main():
     
     if not github_token:
         print("❌ ERROR: GITHUB_TOKEN environment variable required")
-        print("Get token from: https://github.com/settings/tokens")
         sys.exit(1)
     
-    print("🚀 Starting GitHub Repository Crawler")
+    print("🚀 Starting GitHub Repository Crawler", flush=True)
     start_time = datetime.now()
     
     try:
@@ -248,6 +248,10 @@ async def main():
             
             async with GitHubCrawler(github_token) as crawler:
                 repositories = await crawler.crawl_100k()
+                
+                if not repositories:
+                    print("❌ No repositories were collected")
+                    sys.exit(1)
                 
                 # Save in batches
                 batch_size = 1000
@@ -267,6 +271,8 @@ async def main():
     
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 if __name__ == "__main__":
