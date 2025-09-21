@@ -35,24 +35,52 @@ class GitHubCrawler:
             await self.session.close()
     
     def get_search_queries(self) -> List[str]:
-        """Generate effective search queries"""
+        """Generate many more search queries to reach 100K"""
         queries = []
         
-        # Focus on proven working queries
+        # High-value repos (these work well)
         star_ranges = [
             ">=50000", "25000..49999", "10000..24999", "5000..9999", 
-            "2500..4999", "1000..2499", "500..999", "250..499", "100..249", "50..99"
+            "2500..4999", "1000..2499", "500..999", "250..499", 
+            "100..249", "50..99", "25..49", "10..24", "5..9", "2..4", "1"
         ]
         for stars in star_ranges:
             queries.append(f"stars:{stars}")
         
-        # Popular languages with moderate star counts (these work better)
-        languages = ["javascript", "python", "java", "typescript", "go", "rust"]
+        # All major languages with various star counts
+        languages = [
+            "javascript", "python", "java", "typescript", "c++", "c", "php", 
+            "c#", "go", "rust", "swift", "kotlin", "ruby", "scala", "dart",
+            "r", "shell", "css", "html", "vue", "objective-c", "perl", 
+            "matlab", "assembly", "powershell", "haskell", "lua", "groovy"
+        ]
+        
+        # More granular star ranges for languages
+        lang_star_ranges = ["50..99", "25..49", "10..24", "5..9", "3..4", "2", "1"]
         for lang in languages:
-            for stars in ["25..49", "10..24", "5..9"]:
+            for stars in lang_star_ranges:
                 queries.append(f"language:{lang} stars:{stars}")
         
-        return queries[:50]  # Limit to 50 reliable queries
+        # Time-based queries for more coverage (recent repos)
+        years = [2023, 2024, 2025]
+        for year in years:
+            for month in range(1, 13):
+                if year == 2025 and month > 9:  # Don't query future months
+                    continue
+                queries.append(f"stars:1..3 created:{year}-{month:02d}-01..{year}-{month:02d}-28")
+        
+        # Topic-based queries for diversity
+        topics = [
+            "web", "api", "framework", "library", "tool", "bot", "game", 
+            "mobile", "desktop", "cli", "database", "machine-learning",
+            "ai", "blockchain", "security", "testing", "documentation"
+        ]
+        for topic in topics:
+            for stars in ["1..2", "3..5"]:
+                queries.append(f"topic:{topic} stars:{stars}")
+        
+        print(f"Generated {len(queries)} search queries for maximum coverage")
+        return queries
     
     async def fetch_batch(self, query: str) -> List[Repository]:
         """Fetch repositories for one search query"""
@@ -91,7 +119,11 @@ class GitHubCrawler:
                     }
                 ) as response:
                     
-                    if response.status != 200:
+                    if response.status == 403:
+                        print(f"Rate limited on query: {query}, waiting 5 minutes...")
+                        await asyncio.sleep(300)  # Wait 5 minutes on rate limit
+                        continue  # Retry the same query
+                    elif response.status != 200:
                         print(f"HTTP {response.status} for query: {query}")
                         break
                     
@@ -131,13 +163,15 @@ class GitHubCrawler:
                         break
                     cursor = page_info.get("endCursor")
                     
-                    # Rate limit check
+                    # Rate limit handling - be more aggressive about waiting
                     rate_limit = data["data"].get("rateLimit", {})
-                    if rate_limit.get("remaining", 1000) < 100:
-                        print(f"Rate limit low, waiting...")
-                        await asyncio.sleep(60)
+                    remaining = rate_limit.get("remaining", 1000)
+                    if remaining < 500:  # Wait earlier to avoid 403s
+                        wait_time = min(300, (1000 - remaining) * 0.5)  # Scale wait time
+                        print(f"Rate limit at {remaining}, waiting {wait_time:.1f}s...")
+                        await asyncio.sleep(wait_time)
                     
-                    await asyncio.sleep(0.2)  # Small delay
+                    await asyncio.sleep(1.0)  # Longer delay between requests
                     
             except Exception as e:
                 print(f"Network error in query '{query}': {e}")
