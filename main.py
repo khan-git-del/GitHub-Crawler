@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from typing import List, Set
 from datetime import datetime
 
+print("🚀 Starting GitHub Repository Crawler", flush=True)
+
 @dataclass
 class Repository:
     github_id: str
