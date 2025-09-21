@@ -38,7 +38,7 @@ jobs:
       run: pip install aiohttp asyncpg
 
     - name: Setup Postgres
-      run: python -c "import asyncpg; async def setup(): conn = await asyncpg.connect('postgresql://postgres:postgres@localhost:5432/github_crawler'); await conn.execute('CREATE TABLE IF NOT EXISTS repositories (github_id TEXT PRIMARY KEY, name_with_owner TEXT, star_count INTEGER)'); await conn.close(); import asyncio; asyncio.run(setup())"
+      run: python -c "import asyncpg; async def setup(): conn = await asyncpg.connect('postgresql://postgres:postgres@localhost:5432/github_crawler'); await conn.execute('CREATE TABLE IF NOT EXISTS repositories (github_id TEXT PRIMARY KEY, name_with_owner TEXT, star_count INTEGER, crawled_at TIMESTAMP)'); await conn.close(); import asyncio; asyncio.run(setup())"
       env:
         DATABASE_URL: postgresql://postgres:postgres@localhost:5432/github_crawler
 
@@ -56,19 +56,9 @@ jobs:
             conn = await asyncpg.connect(os.environ['DATABASE_URL'])
             rows = await conn.fetch('SELECT github_id, name_with_owner, star_count FROM repositories ORDER BY star_count DESC')
             await conn.close()
-            
             data = [{'github_id': r[0], 'name_with_owner': r[1], 'star_count': r[2]} for r in rows]
-            
-            with open('repositories.json', 'w') as f:
-                json.dump(data, f, indent=2)
-            
-            with open('repositories.csv', 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=['github_id', 'name_with_owner', 'star_count'])
-                writer.writeheader()
-                writer.writerows(data)
-            
-            print(f'Exported {len(data)} repositories')
-
+            with open('repositories.json', 'w') as f: json.dump(data, f, indent=2)
+            with open('repositories.csv', 'w', newline='') as f: csv.DictWriter(f, fieldnames=['github_id', 'name_with_owner', 'star_count']).writerows(data)
         asyncio.run(export())
         "
       env:
