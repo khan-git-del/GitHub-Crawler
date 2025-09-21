@@ -18,7 +18,7 @@ async def fetch_repos(query: str, seen_repos: Set[str]) -> List[Repository]:
     ) as session:
         repos = []
         cursor = None
-        for _ in range(5):
+        for _ in range(10):  # Increased to 10 pages = 1,000 repos max per query
             async with session.post(
                 "https://api.github.com/graphql",
                 json={"query": """
@@ -50,7 +50,7 @@ async def crawl_100k_repositories() -> List[Repository]:
     queries = [
         "stars:>1000", "stars:100..999", "stars:10..99", "language:python stars:1..9",
         "language:javascript stars:1..9", "language:java stars:1..9", "created:2024-01-01..2025-09-21"
-    ] * 25
+    ] * 50  # Increased to 350 queries for better coverage
     all_repos = []
     semaphore = asyncio.Semaphore(10)
     
