@@ -16,7 +16,7 @@ import json
 import random
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-@dataclass(frozen=True)  # Correct placement of frozen=True
+@dataclass(frozen=True)
 class Repository:
     github_id: str
     name_with_owner: str
@@ -38,7 +38,7 @@ class GitHubAPIAdapter:
                 "Authorization": f"Bearer {self.token}",
                 "User-Agent": "GitHub-Crawler/1.0"
             },
-            timeout=aiohttp.ClientTimeout(total=30)
+            timeout=aiohttp.ClientTimeout(total=30)  # 30-second timeout per request
         )
         return self
 
@@ -58,8 +58,9 @@ class GitHubAPIAdapter:
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60))
     async def execute_graphql(self, query: str, variables: dict) -> dict:
-        """Execute GraphQL with retries"""
-        await self.check_rate_limit(expected_cost=1)  # Assume cost ~1-2
+        """Execute GraphQL with retries and timeout"""
+        await self.check_rate_limit(expected_cost=1)
+        print(f"📡 Sending GraphQL query with variables: {variables}")
         
         async with self.session.post(
             "https://api.github.com/graphql",
@@ -69,13 +70,15 @@ class GitHubAPIAdapter:
                 retry_after = int(response.headers.get('Retry-After', 60))
                 print(f"🚫 Rate limited (403), retrying after {retry_after}s")
                 await asyncio.sleep(retry_after)
-                raise Exception("Rate limited")  # Trigger retry
+                raise Exception("Rate limited")
             
             if response.status != 200:
+                print(f"❌ HTTP {response.status} response")
                 raise Exception(f"HTTP {response.status}")
             
             data = await response.json()
             if "errors" in data:
+                print(f"🔴 GraphQL error: {data['errors'][0]['message']}")
                 raise Exception(f"GraphQL error: {data['errors'][0]['message']}")
             
             rate_limit = data["data"].get("rateLimit", {})
@@ -84,6 +87,7 @@ class GitHubAPIAdapter:
             self.rate_limit_limit = rate_limit.get("limit", 5000)
             self.rate_limit_cost = rate_limit.get("cost", 1)
             
+            print(f"✅ Received response, remaining: {self.rate_limit_remaining}")
             return data["data"]
 
 class ProductionGitHubCrawler:
@@ -102,7 +106,6 @@ class ProductionGitHubCrawler:
         """Generate ~200 optimized queries for faster coverage"""
         queries = []
         
-        # 1. Star-based queries (broader ranges)
         star_ranges = [
             ">=50000", "10000..49999", "5000..9999", "1000..4999",
             "500..999", "200..499", "100..199", "50..99", "20..49",
@@ -111,31 +114,24 @@ class ProductionGitHubCrawler:
         for star_range in star_ranges:
             queries.append(f"stars:{star_range} sort:stars-desc")
 
-        # 2. Language + star combinations (reduced)
-        languages = [
-            "javascript", "python", "java", "typescript", "c++", "go", "rust",
-            "php", "c#", "swift", "kotlin", "ruby"
-        ]
+        languages = ["javascript", "python", "java", "typescript", "c++", "go", "rust", "php", "c#", "swift", "kotlin", "ruby"]
         lang_star_ranges = ["50..*", "20..49", "10..19", "5..9", "1..4"]
         for lang in languages:
             for star_range in lang_star_ranges:
                 queries.append(f"language:{lang} stars:{star_range}")
 
-        # 3. Topic-based (reduced)
         topics = ["web", "api", "framework", "machine-learning", "ai", "blockchain", "security"]
         for topic in topics:
             queries.append(f"topic:{topic} stars:1..10")
 
-        # 4. Time-based (quarterly instead of monthly)
         years = [2020, 2021, 2022, 2023, 2024, 2025]
         for year in years:
-            quarters = 4 if year < 2025 else 3  # Up to Q3 2025
+            quarters = 4 if year < 2025 else 3
             for q in range(1, quarters + 1):
                 start_month = (q-1)*3 + 1
                 end_month = start_month + 2
                 queries.append(f"stars:1..5 created:{year}-{start_month:02d}-01..{year}-{end_month:02d}-28")
 
-        # 5. Other diverse queries (reduced)
         for size in ["<5000", "5000..50000", ">50000"]:
             queries.append(f"size:{size} stars:1..3")
         for license_type in ["mit", "apache-2.0", "gpl-3.0"]:
@@ -146,7 +142,7 @@ class ProductionGitHubCrawler:
         return queries
     
     async def execute_graphql_query(self, search_query: str) -> List[Repository]:
-        """Fetch repos for a query using adapter"""
+        """Fetch repos for a query using adapter with max pages limit"""
         graphql_query = """
         query($searchQuery: String!, $cursor: String) {
             search(query: $searchQuery, type: REPOSITORY, first: 100, after: $cursor) {
@@ -178,15 +174,20 @@ class ProductionGitHubCrawler:
         pages_fetched = 0
         
         while pages_fetched < max_pages:
-            data = await self.api_adapter.execute_graphql(
-                graphql_query,
-                {"searchQuery": search_query, "cursor": cursor}
-            )
+            try:
+                data = await asyncio.wait_for(
+                    self.api_adapter.execute_graphql(graphql_query, {"searchQuery": search_query, "cursor": cursor}),
+                    timeout=60  # 1-minute timeout per page fetch
+                )
+            except asyncio.TimeoutError:
+                print(f"⏰ Timeout fetching page {pages_fetched + 1} for query: {search_query}")
+                break
             
             search_result = data["search"]
             nodes = search_result.get("nodes", [])
             
             if not nodes:
+                print(f"📭 No nodes for query: {search_query} at page {pages_fetched + 1}")
                 break
             
             batch_added = 0
@@ -206,17 +207,18 @@ class ProductionGitHubCrawler:
             pages_fetched += 1
             page_info = search_result.get("pageInfo", {})
             if not page_info.get("hasNextPage", False):
+                print(f"✅ Completed {pages_fetched} pages for query: {search_query}")
                 break
             cursor = page_info.get("endCursor")
             
-            # Dynamic delay
             delay = 0.1 if self.api_adapter.rate_limit_remaining > 2000 else 1.0
             await asyncio.sleep(delay)
         
+        print(f"🏁 Fetched {len(repositories)} repos for query: {search_query}")
         return repositories
     
     async def crawl_100k_repositories(self) -> Tuple[List[Repository]]:
-        """Collect 100,000 repos with parallel batches"""
+        """Collect 100,000 repos with parallel batches and timeout"""
         all_repositories = []
         queries = self.generate_comprehensive_queries()
         random.shuffle(queries)
@@ -233,15 +235,23 @@ class ProductionGitHubCrawler:
         batch_size = 10
         for batch_start in range(0, len(queries), batch_size):
             if len(all_repositories) >= 100000:
+                print(f"🎉 Target reached at {len(all_repositories)} repos, stopping crawl")
                 break
             
             batch_queries = queries[batch_start:batch_start + batch_size]
             print(f"\n📊 Processing batch {batch_start // batch_size + 1} ({len(batch_queries)} queries)")
             print(f"📈 Progress: {len(all_repositories):,}/100,000 ({len(all_repositories)/1000:.1f}%)")
             
-            batch_results = await asyncio.gather(*[limited_exec(q) for q in batch_queries])
-            for batch_repos in batch_results:
-                all_repositories.extend(batch_repos)
+            try:
+                batch_results = await asyncio.wait_for(
+                    asyncio.gather(*[limited_exec(q) for q in batch_queries]),
+                    timeout=600  # 10-minute timeout per batch
+                )
+                for batch_repos in batch_results:
+                    all_repositories.extend(batch_repos)
+            except asyncio.TimeoutError:
+                print(f"⏰ Batch {batch_start // batch_size + 1} timed out, continuing with current results")
+                continue
             
             print(f"✅ Added {sum(len(b) for b in batch_results)} repos | Total: {len(all_repositories):,}")
             
