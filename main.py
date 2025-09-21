@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
+"""
+Production GitHub Crawler - Designed to collect exactly 100,000 repositories
+Uses intelligent rate limiting and multiple strategies
+"""
+
 import asyncio
 import aiohttp
 import asyncpg
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Set
+from typing import List, Set, Optional, Tuple
+from datetime import datetime
+import random
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 @dataclass(frozen=True)
 class Repository:
@@ -14,13 +22,22 @@ class Repository:
     star_count: int
 
 class GitHubAPIAdapter:
+    """Anti-corruption layer for GitHub API interactions"""
     def __init__(self, token: str):
         self.token = token
         self.session = None
+        self.rate_limit_remaining: int = 5000
+        self.rate_limit_reset_at: Optional[datetime] = None
+        self.rate_limit_limit: int = 5000
+        self.rate_limit_cost: int = 1
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(
-            headers={"Authorization": f"Bearer {self.token}", "User-Agent": "GitHub-Crawler/1.0"}
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": "GitHub-Crawler/1.0"
+            },
+            timeout=aiohttp.ClientTimeout(total=30)
         )
         return self
 
@@ -28,16 +45,39 @@ class GitHubAPIAdapter:
         if self.session:
             await self.session.close()
 
+    async def check_rate_limit(self, expected_cost: int = 1):
+        if self.rate_limit_remaining < (expected_cost + 100):
+            if self.rate_limit_reset_at:
+                wait_time = max(0, (self.rate_limit_reset_at - datetime.utcnow()).total_seconds() + 10)
+            else:
+                wait_time = 60
+            await asyncio.sleep(wait_time)
+
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60))
     async def execute_graphql(self, query: str, variables: dict) -> dict:
+        await self.check_rate_limit(expected_cost=1)
         async with self.session.post(
             "https://api.github.com/graphql",
             json={"query": query, "variables": variables}
         ) as response:
+            if response.status == 403:
+                retry_after = int(response.headers.get('Retry-After', 60))
+                await asyncio.sleep(retry_after)
+                raise Exception("Rate limited")
+
             if response.status != 200:
                 raise Exception(f"HTTP {response.status}")
+
             data = await response.json()
             if "errors" in data:
                 raise Exception(f"GraphQL error: {data['errors'][0]['message']}")
+
+            rate_limit = data["data"].get("rateLimit", {})
+            self.rate_limit_remaining = rate_limit.get("remaining", 0)
+            self.rate_limit_reset_at = datetime.fromisoformat(rate_limit.get("resetAt").replace('Z', '+00:00')) if rate_limit.get("resetAt") else None
+            self.rate_limit_limit = rate_limit.get("limit", 5000)
+            self.rate_limit_cost = rate_limit.get("cost", 1)
+
             return data["data"]
 
 class ProductionGitHubCrawler:
@@ -54,17 +94,24 @@ class ProductionGitHubCrawler:
 
     def generate_comprehensive_queries(self) -> List[str]:
         queries = []
-        star_ranges = [">=50000", "10000..49999", "5000..9999", "1000..4999", "500..999", "200..499", "100..199", "50..99", "20..49", "10..19", "5..9", "3..4", "2", "1"]
+        star_ranges = [
+            ">=50000", "10000..49999", "5000..9999", "1000..4999",
+            "500..999", "200..499", "100..199", "50..99", "20..49",
+            "10..19", "5..9", "3..4", "2", "1"
+        ]
         for star_range in star_ranges:
             queries.append(f"stars:{star_range} sort:stars-desc")
+
         languages = ["javascript", "python", "java", "typescript", "c++", "go", "rust", "php", "c#", "swift", "kotlin", "ruby"]
         lang_star_ranges = ["50..*", "20..49", "10..19", "5..9", "1..4"]
         for lang in languages:
             for star_range in lang_star_ranges:
                 queries.append(f"language:{lang} stars:{star_range}")
+
         topics = ["web", "api", "framework", "machine-learning", "ai", "blockchain", "security"]
         for topic in topics:
             queries.append(f"topic:{topic} stars:1..10")
+
         years = [2020, 2021, 2022, 2023, 2024, 2025]
         for year in years:
             quarters = 4 if year < 2025 else 3
@@ -72,77 +119,131 @@ class ProductionGitHubCrawler:
                 start_month = (q-1)*3 + 1
                 end_month = start_month + 2
                 queries.append(f"stars:1..5 created:{year}-{start_month:02d}-01..{year}-{end_month:02d}-28")
+
         for size in ["<5000", "5000..50000", ">50000"]:
             queries.append(f"size:{size} stars:1..3")
         for license_type in ["mit", "apache-2.0", "gpl-3.0"]:
             queries.append(f"license:{license_type} stars:1..5")
         queries.append("stars:1..10 pushed:>2024-01-01")
+
         return queries
-    
+
     async def execute_graphql_query(self, search_query: str) -> List[Repository]:
         graphql_query = """
         query($searchQuery: String!, $cursor: String) {
             search(query: $searchQuery, type: REPOSITORY, first: 100, after: $cursor) {
-                nodes { ... on Repository { id, nameWithOwner, stargazerCount } }
-                pageInfo { hasNextPage, endCursor }
+                repositoryCount
+                nodes {
+                    ... on Repository {
+                        id
+                        nameWithOwner
+                        stargazerCount
+                    }
+                }
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+            }
+            rateLimit {
+                limit
+                cost
+                remaining
+                resetAt
             }
         }
         """
+
         repositories = []
         cursor = None
         max_pages = 10
-        while True:
-            data = await self.api_adapter.execute_graphql(graphql_query, {"searchQuery": search_query, "cursor": cursor})
-            nodes = data["search"]["nodes"]
+        pages_fetched = 0
+
+        while pages_fetched < max_pages:
+            try:
+                data = await asyncio.wait_for(
+                    self.api_adapter.execute_graphql(graphql_query, {"searchQuery": search_query, "cursor": cursor}),
+                    timeout=60
+                )
+            except asyncio.TimeoutError:
+                break
+
+            search_result = data["search"]
+            nodes = search_result.get("nodes", [])
+
             if not nodes:
                 break
+
             for node in nodes:
-                if node["id"] not in self.seen_repos:
-                    self.seen_repos.add(node["id"])
+                if not node or "id" not in node:
+                    continue
+                repo_id = node["id"]
+                if repo_id not in self.seen_repos:
+                    self.seen_repos.add(repo_id)
                     repositories.append(Repository(
-                        github_id=node["id"],
+                        github_id=repo_id,
                         name_with_owner=node.get("nameWithOwner", "unknown/unknown"),
                         star_count=max(0, node.get("stargazerCount", 0))
                     ))
-            if not data["search"]["pageInfo"]["hasNextPage"]:
+
+            pages_fetched += 1
+            page_info = search_result.get("pageInfo", {})
+            if not page_info.get("hasNextPage", False):
                 break
-            cursor = data["search"]["pageInfo"]["endCursor"]
+            cursor = page_info.get("endCursor")
+
+            delay = 0.1 if self.api_adapter.rate_limit_remaining > 2000 else 1.0
+            await asyncio.sleep(delay)
+
         return repositories
-    
-    async def crawl_100k_repositories(self) -> Tuple[List[Repository]]:
+
+    async def crawl_100k_repositories(self) -> Tuple[Repository, ...]:
         all_repositories = []
         queries = self.generate_comprehensive_queries()
         random.shuffle(queries)
+
         semaphore = asyncio.Semaphore(5)
+
         async def limited_exec(query):
             async with semaphore:
                 return await self.execute_graphql_query(query)
+
         batch_size = 10
         for batch_start in range(0, len(queries), batch_size):
             if len(all_repositories) >= 100000:
                 break
+
             batch_queries = queries[batch_start:batch_start + batch_size]
-            batch_results = await asyncio.gather(*[limited_exec(q) for q in batch_queries])
-            for batch_repos in batch_results:
-                all_repositories.extend(batch_repos)
-        return tuple(all_repositories[:100000])
+            try:
+                batch_results = await asyncio.wait_for(
+                    asyncio.gather(*[limited_exec(q) for q in batch_queries]),
+                    timeout=600
+                )
+                for batch_repos in batch_results:
+                    all_repositories.extend(batch_repos)
+            except asyncio.TimeoutError:
+                continue
+
+        final_repos = tuple(all_repositories[:100000])
+        return final_repos
 
 class RepositorySaver:
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
         self.pool = None
-    
+
     async def __aenter__(self):
         self.pool = await asyncpg.create_pool(self.connection_url, min_size=1, max_size=3)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.pool:
             await self.pool.close()
-    
+
     async def save_repositories_batch(self, repositories: List[Repository]):
         if not repositories:
             return
+
         sql = """
         INSERT INTO repositories (github_id, name_with_owner, star_count)
         VALUES ($1, $2, $3)
@@ -150,20 +251,41 @@ class RepositorySaver:
             star_count = EXCLUDED.star_count,
             crawled_at = CURRENT_TIMESTAMP
         """
+
         async with self.pool.acquire() as conn:
-            await conn.executemany(sql, [(r.github_id, r.name_with_owner, r.star_count) for r in repositories])
+            await conn.executemany(sql, [
+                (r.github_id, r.name_with_owner, r.star_count)
+                for r in repositories
+            ])
 
 async def main():
     github_token = os.getenv("GITHUB_TOKEN")
+    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/github_crawler")
+
     if not github_token:
         sys.exit(1)
-    database_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/github_crawler")
-    async with ProductionGitHubCrawler(github_token) as crawler:
-        repositories = await crawler.crawl_100k_repositories()
-    async with RepositorySaver(database_url) as saver:
-        batch_size = 2000
-        for i in range(0, len(repositories), batch_size):
-            await saver.save_repositories_batch(repositories[i:i + batch_size])
+
+    start_time = datetime.now()
+
+    try:
+        async with ProductionGitHubCrawler(github_token) as crawler:
+            repositories = await crawler.crawl_100k_repositories()
+
+            if not repositories:
+                sys.exit(1)
+
+            async with RepositorySaver(database_url) as saver:
+                batch_size = 2000
+                for i in range(0, len(repositories), batch_size):
+                    batch = repositories[i:i + batch_size]
+                    await saver.save_repositories_batch(batch)
+
+            duration = (datetime.now() - start_time).total_seconds()
+
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     asyncio.run(main())
